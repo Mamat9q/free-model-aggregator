@@ -1257,6 +1257,29 @@ class Router(object):
                 # on a second fail call -- not worth another call.
                 self.dead.add(provider_id)
 
+    def retry_order(self, failed):
+        """Order for the last-resort retry pass: the (provider, model)
+        pairs that failed in this request, deduplicated, best first.
+
+        A provider's fail_calls are isolated ordinals (at most 2 per
+        provider), so the call right after a failed ordinal usually
+        succeeds -- unless the provider is in outage or out of budget,
+        which the caller cannot tell from the refusal. Ordering by
+        budget floor first: a big-budget provider's next ordinal is
+        least likely to be a second scheduled fail (measured on 1003
+        simulated instances: budget order spends 8 retry calls total
+        vs 10+ for rating order, rescuing the same requests).
+        Deterministic: budget floor, rating, brief provider order, id.
+        """
+        seen = []
+        for pm in failed:
+            if pm not in seen:
+                seen.append(pm)
+        return sorted(seen, key=lambda pm: (
+            -BUDGET_MIN.get(pm[0], DEFAULT_BUDGET_MIN),
+            -self.options[pm]["rating"],
+            self.provider_order.get(pm[0], 999), pm[1]))
+
 
 # ---------------------------------------------------------------------------
 # The entry server.
@@ -1309,6 +1332,14 @@ class Aggregator(object):
             req["json"] = True
         return req
 
+    def _answer_response(self, api, canonical, mid, answer):
+        usage = answer_usage(answer, canonical)
+        if canonical.stream:
+            payload = client_stream_response(api, mid, answer, usage).encode("utf-8")
+            return 200, "text/event-stream; charset=utf-8", payload
+        payload = _json_bytes(client_json_response(api, mid, answer, usage))
+        return 200, "application/json", payload
+
     def serve(self, api, body):
         """One client request -> (status, content_type, payload_bytes)."""
         canonical = Canonical(api, body)
@@ -1322,11 +1353,32 @@ class Aggregator(object):
         # provider (that wire cannot echo json_mode).
         exclude_wires = frozenset({"anthropic"}) if canonical.json_mode else frozenset()
         exclude = set()
+        failed = []  # (provider, model) pairs refused in this request, in order
         last_status = 502
         while True:
             cand = self.router.next_candidate(request_id, requires, frozenset(exclude),
                                               exclude_wires)
             if cand is None:
+                # Last-resort retry pass (single round): every candidate
+                # failed, so this request would otherwise go unserved.
+                # Each provider's fail_calls are isolated ordinals, so the
+                # call right after a failed ordinal usually succeeds; one
+                # more attempt per failed provider, best first. Only runs
+                # on a request that would otherwise be lost (measured: 8
+                # retry calls across 1003 simulated instances), so it
+                # costs nothing on the common path.
+                for pid, mid in self.router.retry_order(failed):
+                    if pid in self.router.dead:
+                        continue
+                    provider = self.provider_by_id[pid]
+                    status, answer = call_provider(self.env_url, provider, mid, canonical)
+                    self.router.record_call(pid, status == 200 and answer is not None)
+                    if status == 200 and answer is not None:
+                        log("retry: %s/%s served after refusal" % (pid, mid))
+                        return self._answer_response(api, canonical, mid, answer)
+                    last_status = status if status else 502
+                    self.router.replan(self.remaining_ids())
+                    log("retry: %s/%s refused again (%s)" % (pid, mid, last_status))
                 status, err = client_error_response(
                     api, 502, "no free model can serve this request")
                 return status, "application/json", _json_bytes(err)
@@ -1335,13 +1387,9 @@ class Aggregator(object):
             status, answer = call_provider(self.env_url, provider, mid, canonical)
             self.router.record_call(pid, status == 200 and answer is not None)
             if status == 200 and answer is not None:
-                usage = answer_usage(answer, canonical)
-                if canonical.stream:
-                    payload = client_stream_response(api, mid, answer, usage).encode("utf-8")
-                    return 200, "text/event-stream; charset=utf-8", payload
-                payload = _json_bytes(client_json_response(api, mid, answer, usage))
-                return 200, "application/json", payload
+                return self._answer_response(api, canonical, mid, answer)
             last_status = status if status else 502
+            failed.append((pid, mid))
             exclude.add(pid)
             # Drop the provider, re-plan what is left, and fail over.
             self.router.replan(self.remaining_ids())
@@ -1478,6 +1526,15 @@ def load_policy():
         #   first call of a provider a later scarce request needs.
         # - tie_break "budget": same rating -> bigger budget floor first
         #   (a repeat call there is less likely to land on a fail number).
+        # - Last-resort retry (in Aggregator.serve, not a policy knob):
+        #   when every candidate for a request has refused, retry each
+        #   failed provider once, budget-floor first (Router.retry_order).
+        #   A provider's fail_calls are isolated ordinals, so the call
+        #   after a failed ordinal usually succeeds. Measured on 1003
+        #   simulated instances: rescues all 7 requests the old code left
+        #   unserved (min_context r10/r12) at 8 retry calls total, and
+        #   never triggers on the 3 practice trials (22/21/21 calls
+        #   unchanged). See NOTES.md "Retry pass (16 Nov 2026)".
         # REJECTED by measurement (see NOTES.md): per-call rating penalties
         # and demote-after-1-failure both strand scarce requests (vision
         # r06 / min_context r12 unserved on fresh draws); a min_context
