@@ -1091,6 +1091,10 @@ class Router(object):
         self.tie_break = self.policy.get("tie_break", "order")
         self.plan_order = self.policy.get("plan_order", "scarcity")
         self.reserve_map = self.policy.get("reserve_map") or {}
+        # min_cap: floor for a provider's soft cap. A provider's first call
+        # always succeeds (generator invariant), so a cap of 0 wrongly
+        # removes its top model from the under-cap pool.
+        self.min_cap = self.policy.get("min_cap", 0)
         # (provider, model) -> {rating, caps} for every free model.
         self.options = {}
         for row in brief.ratings:
@@ -1110,7 +1114,8 @@ class Router(object):
 
     def soft_cap(self, provider_id):
         reserve = self.reserve_map.get(provider_id, self.cap_reserve)
-        return max(0, BUDGET_MIN.get(provider_id, DEFAULT_BUDGET_MIN) - reserve)
+        return max(self.min_cap,
+                   BUDGET_MIN.get(provider_id, DEFAULT_BUDGET_MIN) - reserve)
 
     def wire_exclusions(self, req):
         """Wires that cannot carry this request's echo fields.
@@ -1455,18 +1460,32 @@ def make_handler(agg):
 def load_policy():
     raw = os.environ.get("MAKEFUN_POLICY_JSON") or ""
     if not raw:
-        # Tuned on 3 practice trials + 50 fresh generator instances
-        # (score 99 on 53/53; see NOTES.md). Rationale:
-        # - cap_reserve 3 (2 for the three top providers) spreads load so
-        #   each provider's early fail numbers are rarely all hit, while
-        #   keeping the best models on the weight-2/scarce requests.
+        # Tuned on 3 practice trials + 150 fresh generator instances
+        # (score 99 on 153/153; see NOTES.md "Call optimization", 15 Nov 2026).
+        # Rationale:
+        # - cap_reserve 5 (no reserve_map): spreads load across all 10
+        #   providers, so each provider's failure-prone 2nd/3rd calls are
+        #   rarely all hit; the plan uses every provider's guaranteed-free
+        #   first call. Mean 23.1 calls vs 25.2 for the old cap-3 policy.
+        # - min_cap 1: a provider's soft cap never drops to 0, so its top
+        #   model stays in the under-cap pool (cap 5 alone zeroes the
+        #   small-budget providers' caps: zai/sambanova/ovh/cerebras).
         # - max_failures 3: a provider's fail_calls number at most 2, so a
         #   provider that refused twice and is still alive is clean on the
         #   third try; a fourth retry never helped in simulation.
-        # - plan_order "weight": weight-2 requests claim top models first.
-        return {"cap_reserve": 3, "max_failures": 3, "demote_failed": False,
-                "tie_break": "order", "plan_order": "weight",
-                "reserve_map": {"openrouter": 2, "cloudflare": 2, "gemini": 2}}
+        # - plan_order "scarcity": scarcest requests (vision, min_context)
+        #   claim their providers first, so a filler can never steal the
+        #   first call of a provider a later scarce request needs.
+        # - tie_break "budget": same rating -> bigger budget floor first
+        #   (a repeat call there is less likely to land on a fail number).
+        # REJECTED by measurement (see NOTES.md): per-call rating penalties
+        # and demote-after-1-failure both strand scarce requests (vision
+        # r06 / min_context r12 unserved on fresh draws); a min_context
+        # reservation guard cost earned AND calls. Keep the preference
+        # order strictly rating-first within the under-cap pool.
+        return {"cap_reserve": 5, "max_failures": 3, "demote_failed": False,
+                "tie_break": "budget", "plan_order": "scarcity",
+                "reserve_map": {}, "min_cap": 1}
     try:
         policy = json.loads(raw)
         return policy if isinstance(policy, dict) else {}
